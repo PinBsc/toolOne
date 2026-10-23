@@ -37,8 +37,23 @@ export function gweiLabel(feePerGas: bigint): string {
   return `${formatAmount(feePerGas, 9, 4)} gwei`;
 }
 
+export const includedUnseenMessage =
+  "上一笔交易已经上链，但余额还没有对上。请先到区块浏览器核对，不要立刻重发。";
+
+export const balanceNonceMismatchMessage =
+  "主币余额和交易序号对不上。请先到区块浏览器核对，不要立刻重发。";
+
 export function blocksAnotherSend(message: string): boolean {
   return /不要用同一计划重发|不要立刻重发/.test(message);
+}
+
+export function canAutoRetry(message: string): boolean {
+  if (/没有发出交易|已取消|余额不足|主币余额不够|主币不够|gas 已经高于|执行失败|拒绝了这笔转账|余额没有减少|私钥和生成计划|已停止/.test(message)) {
+    return false;
+  }
+  return /超时|没有返回交易结果|序号已经增加|可能已经广播|可能仍在打包|连接失败|网络|ECONN|socket hang up|failed to fetch|replacement|already known|nonce too low|underpriced/.test(
+    message,
+  );
 }
 
 function errorText(err: unknown): string {

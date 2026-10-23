@@ -81,4 +81,5 @@ export interface RunResult {
   okLines: number[];
   failed: LineFailure[];
   stopped: boolean;
+  nativeLeft: boolean;
 }

@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import { parseChainId, readFinalAddresses } from "./chainIo";
 import {
   blocksAnotherSend,
+  canAutoRetry,
   explainError,
+  balanceNonceMismatchMessage,
+  includedUnseenMessage,
   formatAmount,
   isDefiniteReject,
   isUncertainSendError,
@@ -228,6 +231,18 @@ describe("chain id and errors", () => {
     expect(explainError(new Error("replacement fee too low"))).toMatch(/序号冲突/);
     expect(blocksAnotherSend("交易 0xabc 可能仍在打包，不要用同一计划重发。")).toBe(true);
     expect(blocksAnotherSend("余额不足，已取消，没有发出交易。")).toBe(false);
+    expect(canAutoRetry("等待确认超时。交易 0xabc 可能仍在打包，不要用同一计划重发。")).toBe(true);
+    expect(canAutoRetry("节点没有返回交易结果，但 0xabc 的交易序号已经增加。不要立刻重发。")).toBe(true);
+    expect(canAutoRetry("节点没有返回交易结果，暂时不能确认 0xabc 这笔交易有没有广播。请先到区块浏览器查看，不要立刻重发。")).toBe(true);
+    expect(canAutoRetry("节点连接失败或超时。可以换一个 RPC 再试。")).toBe(true);
+    expect(canAutoRetry("余额不足，已取消，没有发出交易。")).toBe(false);
+    expect(canAutoRetry("交易已上链但执行失败。转出的金额还在发送地址，只花了手续费。")).toBe(false);
+    expect(canAutoRetry("代币交易已上链，但余额没有减少，主币没有继续转出。")).toBe(false);
+    expect(canAutoRetry("已停止后续转账。已经发出的那一笔会继续上链。")).toBe(false);
+    expect(canAutoRetry(includedUnseenMessage)).toBe(false);
+    expect(blocksAnotherSend(includedUnseenMessage)).toBe(true);
+    expect(canAutoRetry(balanceNonceMismatchMessage)).toBe(false);
+    expect(blocksAnotherSend(balanceNonceMismatchMessage)).toBe(true);
   });
 });
 

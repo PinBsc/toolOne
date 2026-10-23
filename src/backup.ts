@@ -75,5 +75,4 @@ export function downloadBackup(plan: TransferPlan): void {
   document.body.appendChild(link);
   link.click();
   link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 1500);
 }

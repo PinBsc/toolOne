@@ -2,11 +2,34 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { downloadBackup } from "./backup";
 import { CHAIN_LIST, CHAINS, MAX_HOPS } from "./chains";
 import { addressFromPrivateKey, createPlan, refreshPlanBalances } from "./chainIo";
-import { explainError, formatAmount, gweiLabel, shortAddr } from "./format";
+import { blocksAnotherSend, explainError, formatAmount, gweiLabel, shortAddr } from "./format";
 import { fundingGap, transactionCount } from "./plan";
 import { entryError, redactRpcUrl, resolveEntry, resolveRpcUrls, RPC_PROVIDER_OPTIONS, type RpcEntry, type RpcProvider } from "./rpc";
 import { runPlan } from "./runner";
 import type { ChainKey, LineFailure, LineProgress, LogEntry, TokenMode, TransferPlan } from "./types";
+
+function newId(): string {
+  const cryptoObj = globalThis.crypto;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") return cryptoObj.randomUUID();
+  return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function notedBroadcasts(messages: string[], explorerTx?: string): LogEntry[] {
+  const notes: LogEntry[] = [];
+  for (const message of messages) {
+    if (!message.includes("已经广播") || message.includes("可能已经广播")) continue;
+    const hash = message.match(/0x[0-9a-fA-F]{64}/)?.[0];
+    if (!hash) continue;
+    notes.push({
+      id: newId(),
+      level: "error",
+      message,
+      txHash: hash,
+      explorerUrl: explorerTx ? `${explorerTx}${hash}` : undefined,
+    });
+  }
+  return notes;
+}
 
 const STATE_LABEL: Record<LineProgress["state"], string> = {
   pending: "等待",
@@ -45,6 +68,7 @@ export function App() {
   const generateLock = useRef(false);
   const startLock = useRef(false);
   const [retryBlocked, setRetryBlocked] = useState(false);
+  const [planUsed, setPlanUsed] = useState(false);
   const chain = CHAINS[chainKey];
 
   const startPreview = useMemo(() => {
@@ -58,7 +82,7 @@ export function App() {
 
   const gap = plan ? fundingGap(plan) : null;
   const consumed = logs.some((entry) => Boolean(entry.txHash));
-  const canStart = Boolean(plan && backupSaved && gap?.ok && !running && !consumed && !planning && !retryBlocked);
+  const canStart = Boolean(plan && backupSaved && gap?.ok && !running && !consumed && !planUsed && !planning && !retryBlocked);
   const allDone = Boolean(
     plan && !running && plan.lines.every((line) => progress[line.index]?.state === "done"),
   );
@@ -68,7 +92,7 @@ export function App() {
   }, [logs]);
 
   function invalidate() {
-    if (running) return;
+    if (running || planUsed || logs.some((entry) => entry.txHash)) return;
     setPlan(null);
     setPlanError("");
     setBackupSaved(false);
@@ -81,8 +105,8 @@ export function App() {
 
   function blockReason(): string {
     if (!plan) return "先生成计划。";
+    if (consumed || planUsed) return "这笔计划已经发出过交易。中间钱包私钥在下面，也可以再下载备份。要做新的一笔，请先保存备份再刷新页面。";
     if (retryBlocked) return "上一笔交易可能已经广播。请先到区块浏览器确认，不要立刻重发。";
-    if (consumed) return "这笔计划已经发出过交易，请重新生成。";
     if (!backupSaved) return "先下载私钥备份，再开始。";
     if (gap?.tokenShort) return "起始钱包的代币余额不够。";
     if (gap?.nativeShort) return "起始钱包的主币不够支付转出数量和后续手续费。";
@@ -90,17 +114,20 @@ export function App() {
   }
 
   async function generate() {
-    if (generateLock.current || running || planning) return;
+    if (generateLock.current || running || planning || planUsed || logs.some((entry) => entry.txHash)) return;
     generateLock.current = true;
     setPlanning(true);
-    setPlan(null);
+    const hadBroadcast = logs.some((entry) => entry.txHash);
+    if (!hadBroadcast) {
+      setPlan(null);
+      setConfirming(false);
+      setFailures([]);
+      setRunError("");
+      setLogs([]);
+      setProgress({});
+      setBackupSaved(false);
+    }
     setPlanError("");
-    setConfirming(false);
-    setFailures([]);
-    setRunError("");
-    setLogs([]);
-    setProgress({});
-    setBackupSaved(false);
     try {
       const nodeError = rpcEntries.map((entry) => entryError(chainKey, entry)).find((item) => item);
       if (nodeError) throw new Error(nodeError);
@@ -117,8 +144,14 @@ export function App() {
         finalAddresses: finals,
       });
       setPlan(next);
+      setConfirming(false);
+      setFailures([]);
+      setRunError("");
+      setLogs([]);
+      setProgress({});
+      setBackupSaved(false);
     } catch (err) {
-      setPlan(null);
+      if (!hadBroadcast) setPlan(null);
       setPlanError(explainError(err));
     } finally {
       generateLock.current = false;
@@ -165,15 +198,29 @@ export function App() {
         plan,
         startPrivateKey: privateKey,
         signal: controller.signal,
-        onLog: (entry) => setLogs((prev) => [...prev, { ...entry, id: crypto.randomUUID() }]),
+        onLog: (entry) => {
+          const id = newId();
+          setLogs((prev) => [...prev, { ...entry, id }]);
+        },
         onProgress: (item) => setProgress((prev) => ({ ...prev, [item.line]: item })),
+        onPlanUsed: () => setPlanUsed(true),
       });
       setFailures(result.failed);
       if (result.failed.some((failure) => failure.blocksRetry)) setRetryBlocked(true);
+      const noted = notedBroadcasts(
+        result.failed.map((failure) => failure.message),
+        CHAINS[plan.chainKey].explorerTx,
+      );
+      if (noted.length > 0) setLogs((prev) => [...prev, ...noted]);
       if (result.stopped) setRunError("已停止。请按日志和备份处理还停在中间的资金。");
       else if (result.failed.length > 0) setRunError("有线条停住了。资金位置写在下面，私钥也在备份文件里。");
+      else if (result.nativeLeft) setRunError("代币已经到达最终地址。有剩余主币留在中间钱包，私钥在页面下方。");
     } catch (err) {
-      setRunError(explainError(err));
+      const message = explainError(err);
+      setRunError(message);
+      if (blocksAnotherSend(message)) setRetryBlocked(true);
+      const noted = notedBroadcasts([message], plan ? CHAINS[plan.chainKey].explorerTx : undefined);
+      if (noted.length > 0) setLogs((prev) => [...prev, ...noted]);
     } finally {
       startLock.current = false;
       setRunning(false);
@@ -210,11 +257,11 @@ export function App() {
           className="panel"
           onSubmit={(event) => {
             event.preventDefault();
-            if (!running && !planning) void generate();
+            if (!running && !planning && !confirming) void generate();
           }}
         >
           <h2>参数</h2>
-          <fieldset className="fields" disabled={running || planning}>
+          <fieldset className="fields" disabled={running || planning || confirming}>
             <Seg
               label="网络"
               value={chainKey}
@@ -306,6 +353,7 @@ export function App() {
               {tokenMode === "erc20"
                 ? " 每一跳先转走全部代币，再把剩余主币转给下一个地址。"
                 : " 每一跳把余额全部转走，只留下当前这一笔的手续费。"}
+              某一跳中断后会自动接着查链上结果并继续，已经发出去的那一笔不会再发一次。
             </p>
             {chainKey === "ethereum" && hopCount >= 20 ? (
               <p className="hint warn">以太坊跳数一多，手续费会明显变高。生成计划后先看需要的 ETH。</p>
@@ -367,7 +415,7 @@ export function App() {
             ))}
           </fieldset>
           <div className="actions">
-            <button className="primary" type="submit" disabled={running || planning}>
+            <button className="primary" type="submit" disabled={running || planning || consumed || planUsed || confirming}>
               {planning ? "正在读取链上数据…" : "生成计划"}
             </button>
           </div>
@@ -478,7 +526,7 @@ export function App() {
                     跳，大约 {txCount} 笔链上交易。请确认备份文件已经保存到电脑上。
                   </p>
                   <div className="plan-actions">
-                    <button className="primary" type="button" onClick={() => void start()}>
+                    <button className="primary" type="button" disabled={!canStart} onClick={() => void start()}>
                       确认开始
                     </button>
                     <button className="ghost" type="button" onClick={() => setConfirming(false)}>
@@ -498,8 +546,8 @@ export function App() {
                   ) : null}
                 </div>
               )}
-              {!canStart && !running && !confirming ? <p className="hint warn">{reason}</p> : null}
-              {retryBlocked ? (
+              {!canStart && !running ? <p className="hint warn">{reason}</p> : null}
+              {retryBlocked && !consumed && !planUsed ? (
                 <button className="ghost" type="button" onClick={() => setRetryBlocked(false)}>
                   我已在浏览器确认没有上链，允许重新开始
                 </button>
@@ -565,7 +613,7 @@ function RpcList({
 }) {
   function add(provider: RpcProvider) {
     if (entries.length >= 8) return;
-    onChange([...entries, { id: crypto.randomUUID(), provider, secret: "" }]);
+    onChange([...entries, { id: newId(), provider, secret: "" }]);
   }
 
   return (
